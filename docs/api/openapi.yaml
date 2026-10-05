@@ -1,0 +1,3316 @@
+openapi: 3.1.0
+
+info:
+  title: Automia API
+  version: 1.0.0
+  summary: Multi-tenant workflow orchestration API.
+  description: |
+    # Automia API
+
+    Automia is a multi-tenant workflow orchestration engine. This document is the
+    **Proposed** REST contract for v1. It is normative for the shape of requests
+    and responses, and it is generated from — and must be kept consistent with —
+    the architecture documents:
+
+    | Concern | Authoritative document |
+    |---|---|
+    | Execution semantics, state machines, retry, idempotency | [execution-engine.md](../architecture/execution-engine.md) |
+    | Component boundaries, deployment, technology choices | [system-overview.md](../architecture/system-overview.md) |
+    | Failure behaviour, delivery guarantees, runbooks | [reliability.md](../architecture/reliability.md) |
+    | Authentication, authorization, SSRF, webhooks, audit | [security.md](../architecture/security.md) |
+    | Immutable workflow versions | [ADR-005](../adr/005-workflow-versioning.md) |
+    | Four-layer idempotency | [ADR-007](../adr/007-idempotency-strategy.md) |
+
+    ## Delivery semantics
+
+    Delivery is **at-least-once**, and this API is written accordingly. It is not
+    exactly-once, and no endpoint claims to be. See
+    [ADR-007](../adr/007-idempotency-strategy.md).
+
+    `POST` endpoints that create durable business facts accept an
+    `Idempotency-Key` header. Supplying one is how a client makes a retry safe,
+    and it is **required** on execution creation, because a duplicate execution is
+    customer-visible and billable.
+
+    ## Response timing
+
+    `POST /v1/organizations/{organizationId}/executions` returns `202 Accepted`
+    after the execution and its first dispatch are **committed**. It never waits
+    for a step to complete. A webhook provider's timeout must not be able to
+    cause a duplicate accept, which the `dedup_key` mechanism handles
+    ([reliability.md](../architecture/reliability.md) §8).
+
+    ## Errors
+
+    All errors are [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) Problem
+    Documents served as `application/problem+json`, with a stable
+    machine-readable `code` and a `traceId` for support
+    ([security.md](../architecture/security.md) §3.6).
+
+    | Status | Used for |
+    |---|---|
+    | `400` | Malformed request; the `type` names the problem |
+    | `401` | No or invalid credential |
+    | `403` | Authenticated, but the permission is denied **within your own organization** |
+    | `404` | Does not exist, **or exists in another organization** — deliberately indistinguishable |
+    | `409` | State conflict, with a `code` naming the unmet precondition |
+    | `422` | Semantically invalid, including `IDEMPOTENCY_KEY_MISMATCH` |
+    | `429` | Rate limited; `Retry-After` is set |
+    | `500` | Opaque, with a `traceId`. No stack traces, SQL text, file paths, or internal hostnames |
+
+    ## Pagination
+
+    Cursor-based (`limit` + `cursor`) on every list endpoint, because the
+    execution and audit tables are append-heavy and offset pagination degrades on
+    them. Cursors are opaque and must not be parsed.
+
+    ## Versioning
+
+    Workflow *definitions* are versioned immutably and are not part of this
+    contract's URL space — see `workflows/{workflowSlug}/versions`. This API's own
+    compatibility follows semantic versioning; breaking changes require a new
+    major path prefix.
+  license:
+    name: Proprietary
+  contact:
+    name: Automia
+    url: https://automia.dev
+
+jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
+
+servers:
+  - url: https://api.automia.dev
+    description: Production
+  - url: https://api.staging.automia.dev
+    description: Staging
+  - url: http://localhost:3000
+    description: Local development
+
+security:
+  - sessionCookie: []
+  - apiKeyBearer: []
+
+tags:
+  - name: Organizations
+    description: Tenant management, membership, and roles.
+  - name: Members
+    description: Membership and invitations.
+  - name: API keys
+    description: Programmatic access, scoped to an organization.
+  - name: Workflows
+    description: Definition authoring, validation, and immutable versions.
+  - name: Executions
+    description: Triggering, inspecting, cancelling, and retrying workflow runs.
+  - name: Webhook endpoints
+    description: Inbound trigger endpoints and delivery history.
+  - name: Schedules
+    description: Cron-based trigger definitions.
+  - name: Credentials
+    description: Stored third-party secrets referenced by `http` and `email` steps.
+  - name: Audit
+    description: The transactional audit log.
+  - name: Authentication
+    description: Brokered to Better Auth. Not our authorization model.
+  - name: Webhooks
+    description: The unauthenticated inbound trigger surface.
+  - name: Health
+    description: Liveness and readiness. No authentication.
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+paths:
+  # --- Organizations -------------------------------------------------------
+
+  /v1/organizations:
+    get:
+      tags: [Organizations]
+      operationId: listOrganizations
+      summary: List the organizations the caller belongs to
+      description: |
+        Scoped to the caller, not to a path parameter, so it needs only
+        `organization:read` on any membership.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Organizations visible to the caller.
+          headers:
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/XRateLimitRemaining'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrganizationPage'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    post:
+      tags: [Organizations]
+      operationId: createOrganization
+      summary: Create an organization
+      description: |
+        The creating user becomes its single `OWNER`
+        ([security.md](../architecture/security.md) §4.1).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrganizationRequest'
+      responses:
+        '201':
+          description: Created.
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Organization' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: The slug is already taken.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                slugTaken:
+                  value:
+                    type: https://automia.dev/problems/organization-slug-taken
+                    title: Organization slug already taken
+                    status: 409
+                    code: ORGANIZATION_SLUG_TAKEN
+                    detail: The slug "acme" is already in use.
+                    traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+        '422': { $ref: '#/components/responses/UnprocessableContent' }
+
+  /v1/organizations/{organizationId}:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+    get:
+      tags: [Organizations]
+      operationId: getOrganization
+      summary: Get an organization
+      responses:
+        '200':
+          description: The organization.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Organization' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Organizations]
+      operationId: updateOrganization
+      summary: Update an organization
+      description: Requires `organization:update`. Not permitted to `DEVELOPER`, `OPERATOR`, `VIEWER`.
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema: { $ref: '#/components/schemas/UpdateOrganizationRequest' }
+      responses:
+        '200':
+          description: The updated organization.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Organization' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Organizations]
+      operationId: deleteOrganization
+      summary: Delete an organization
+      description: |
+        Requires `OWNER` **and** `organization:delete`. Irreversible; all
+        workflows, versions, executions, steps, credentials, and audit rows owned
+        by the organization are removed. Not a soft delete.
+      responses:
+        '204': { description: Deleted. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: The caller is not the `OWNER`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                notOwner:
+                  value:
+                    type: https://automia.dev/problems/owner-required
+                    title: Owner role required
+                    status: 403
+                    code: OWNER_REQUIRED
+                    detail: Only an OWNER can delete an organization.
+                    traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # --- Members -------------------------------------------------------------
+
+  /v1/organizations/{organizationId}/members:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+    get:
+      tags: [Members]
+      operationId: listMembers
+      summary: List members
+      description: Requires `membership:read`.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Members, including pending invitations.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MemberPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Members]
+      operationId: createMembershipInvitation
+      summary: Invite a member
+      description: |
+        Requires `membership:write`. Grants a role, never a permission set: roles
+        are a convenience for humans, and the guards check permissions
+        ([security.md](../architecture/security.md) §4.1).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateInvitationRequest' }
+      responses:
+        '201':
+          description: Invitation created. The token is returned once and never again.
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MembershipInvitation' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: A pending invitation already exists for that address.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/organizations/{organizationId}/members/{userId}:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+      - name: userId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    patch:
+      tags: [Members]
+      operationId: updateMemberRole
+      summary: Change a member's role
+      description: |
+        Requires `membership:write`. Changing a user's role **revokes all of that
+        user's sessions** on other devices, so the change takes effect
+        immediately ([security.md](../architecture/security.md) §2.3).
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+              required: [role]
+              properties:
+                role: { $ref: '#/components/schemas/Role' }
+      responses:
+        '200':
+          description: The updated membership.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Member' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: The change would remove the last `OWNER`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                lastOwner:
+                  value:
+                    type: https://automia.dev/problems/last-owner
+                    title: Cannot remove the last owner
+                    status: 409
+                    code: LAST_OWNER
+                    detail: An organization must retain at least one OWNER. Transfer ownership first.
+                    traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+    delete:
+      tags: [Members]
+      operationId: removeMember
+      summary: Remove a member
+      description: |
+        Requires `membership:write`. Revokes the removed member's sessions
+        immediately. A member may remove themselves.
+      responses:
+        '204': { description: Removed. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: The member is the last `OWNER`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  # --- Roles ---------------------------------------------------------------
+
+  /v1/roles:
+    get:
+      tags: [Organizations]
+      operationId: listRolePermissions
+      summary: The role-to-permission matrix
+      description: |
+        A static, authenticated, read-only description of what each role grants,
+        so a dashboard can render capability honestly instead of inferring it.
+
+        This is **documentation, not enforcement**. The guards check permissions,
+        not role names, so adding a role later does not require touching call
+        sites — and a client that renders from this endpoint is still subject to
+        server-side checks. Reading it requires only a valid session or key, and
+        reveals nothing about a specific organization.
+      responses:
+        '200':
+          description: The matrix, ordered from most to least privileged.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [roles]
+                properties:
+                  roles:
+                    type: array
+                    items: { $ref: '#/components/schemas/RolePermissions' }
+              examples:
+                default:
+                  value:
+                    roles:
+                      - role: OWNER
+                        permissions: ['*']
+                      - role: ADMIN
+                        permissions:
+                          - organization:read
+                          - organization:update
+                          - membership:read
+                          - membership:write
+                          - workflow:read
+                          - workflow:write
+                          - workflow:publish
+                          - workflow:delete
+                          - execution:read
+                          - execution:trigger
+                          - execution:operate
+                          - credential:read
+                          - credential:write
+                          - apikey:read
+                          - apikey:write
+                          - webhook:read
+                          - webhook:write
+                          - schedule:read
+                          - schedule:write
+                          - audit:read
+                      - role: DEVELOPER
+                        permissions:
+                          - workflow:read
+                          - workflow:write
+                          - workflow:publish
+                          - execution:read
+                          - execution:trigger
+                          - execution:operate
+                          - webhook:read
+                          - webhook:write
+                          - schedule:read
+                          - schedule:write
+                      - role: OPERATOR
+                        permissions:
+                          - execution:read
+                          - execution:trigger
+                          - execution:operate
+                      - role: VIEWER
+                        permissions:
+                          - organization:read
+                          - membership:read
+                          - workflow:read
+                          - execution:read
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # --- API keys ------------------------------------------------------------
+
+  /v1/organizations/{organizationId}/api-keys:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+    get:
+      tags: [API keys]
+      operationId: listApiKeys
+      summary: List API keys
+      description: |
+        Requires `apikey:read`. Only `keyPrefix`, `name`, `scopes`, and
+        `lastUsedAt` are ever returned. The secret is stored as an Argon2id hash
+        and cannot be retrieved by any endpoint, including this one
+        ([security.md](../architecture/security.md) §2.5).
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: API keys.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiKeyPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [API keys]
+      operationId: createApiKey
+      summary: Create an API key
+      description: |
+        Requires `apikey:write`. The full key is present in the `201` response
+        **only**. It is not retrievable afterwards. Format:
+        `ak_live_{prefix}_{secret}` — an 8-character indexed prefix plus a
+        32-character ~190-bit secret.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateApiKeyRequest' }
+      responses:
+        '201':
+          description: Created. The `key` field is shown once.
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CreatedApiKey' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/UnprocessableContent' }
+
+  /v1/organizations/{organizationId}/api-keys/{apiKeyId}:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+      - $ref: '#/components/parameters/ApiKeyId'
+    delete:
+      tags: [API keys]
+      operationId: deleteApiKey
+      summary: Revoke an API key
+      description: |
+        Requires `apikey:write`. Immediate and irreversible. The key fails on its
+        next request; there is no grace period, which is why `POST` creating a
+        replacement should be done first and verified before the old key is
+        revoked.
+      responses:
+        '204': { description: Revoked. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # --- Workflows -----------------------------------------------------------
+
+  /v1/organizations/{organizationId}/workflows:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+    get:
+      tags: [Workflows]
+      operationId: listWorkflows
+      summary: List workflows
+      description: Requires `workflow:read`.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Workflows.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkflowPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Workflows]
+      operationId: createWorkflow
+      summary: Create a workflow
+      description: |
+        Requires `workflow:write`. The first version is created as a `draft`.
+        Publish it to make it runnable — see
+        `publishWorkflowVersion` (`POST .../versions/{version}`).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateWorkflowRequest' }
+      responses:
+        '201':
+          description: Created, with version 1 in `draft`.
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Workflow' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422':
+          description: The definition failed graph or node validation.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                cycle:
+                  value:
+                    type: https://automia.dev/problems/workflow-has-cycle
+                    title: Workflow graph contains a cycle
+                    status: 422
+                    code: WORKFLOW_HAS_CYCLE
+                    detail: 'Node "notify-customer" participates in a cycle: notify-customer -> charge-payment -> notify-customer.'
+                    traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+                unknownType:
+                  value:
+                    type: https://automia.dev/problems/unknown-step-type
+                    title: Unknown step type
+                    status: 422
+                    code: UNKNOWN_STEP_TYPE
+                    detail: 'Node "sync-crm" has type "database", which is not one of: condition, delay, email, http.'
+                    traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+                ssrf:
+                  value:
+                    type: https://automia.dev/problems/url-not-permitted
+                    title: URL is not permitted by the egress policy
+                    status: 422
+                    code: URL_NOT_PERMITTED
+                    detail: 'Node "charge-payment" targets 169.254.169.254, which is in a blocked range.'
+                    traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+        '409':
+          description: The slug is already taken within this organization.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/organizations/{organizationId}/workflows/{workflowSlug}:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+      - $ref: '#/components/parameters/WorkflowSlug'
+    get:
+      tags: [Workflows]
+      operationId: getWorkflow
+      summary: Get a workflow with its current version
+      description: |
+        Requires `workflow:read`. Returns the workflow identity, the current
+        version's immutable definition, and the draft, if one exists.
+      responses:
+        '200':
+          description: The workflow.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Workflow' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Workflows]
+      operationId: updateWorkflowDraft
+      summary: Update the draft
+      description: |
+        Requires `workflow:write`. Writes to the **draft** version if one exists,
+        otherwise creates version *n+1* as a draft.
+
+        Validation runs on every save — envelope, node, edge, graph, and static
+        `http` URL checks — so an error is reported next to the edit that caused
+        it rather than at trigger time.
+
+        A `PUT` whose `definitionHash` matches the current draft or published
+        version is a no-op that returns the existing version, so editing and
+        reverting does not consume a version number.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateWorkflowDraftRequest' }
+      responses:
+        '200':
+          description: The draft, or the unchanged version if deduplicated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkflowVersion' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Another author holds the draft, or the graph conflicts with a running execution's pinned version. The `code` names which.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                draftLocked:
+                  value:
+                    type: https://automia.dev/problems/draft-locked
+                    title: Draft is being edited elsewhere
+                    status: 409
+                    code: DRAFT_LOCKED
+                    detail: Version 7 draft was last modified by another session. Reload and reapply your changes.
+                    traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+        '412':
+          description: The `If-Match` definition hash no longer matches.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '422':
+          description: The definition failed validation.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/organizations/{organizationId}/workflows/{workflowSlug}/validate:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+      - $ref: '#/components/parameters/WorkflowSlug'
+    post:
+      tags: [Workflows]
+      operationId: validateWorkflowDefinition
+      summary: Validate a definition without saving it
+      description: |
+        Requires `workflow:read`. Runs the identical validator used on write, so
+        a client-side editor can get authoritative feedback. Nothing is persisted.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WorkflowDefinition' }
+      responses:
+        '200':
+          description: Validation passed. `errors` is empty.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ValidationReport' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422':
+          description: Validation failed. The `code` names the first problem; `detail` lists the rest.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/organizations/{organizationId}/workflows/{workflowSlug}/versions:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+      - $ref: '#/components/parameters/WorkflowSlug'
+    get:
+      tags: [Workflows]
+      operationId: listWorkflowVersions
+      summary: List a workflow's versions
+      description: |
+        Requires `workflow:read`. Versions are **retained indefinitely** — they are
+        excluded from the execution retention sweeper, because an execution's
+        definition must remain resolvable for as long as the execution does
+        ([ADR-005](../adr/005-workflow-versioning.md)).
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Versions, newest first. Use `includeDefinition=false` for a metadata-only listing.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkflowVersionPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/organizations/{organizationId}/workflows/{workflowSlug}/versions/{version}:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+      - $ref: '#/components/parameters/WorkflowSlug'
+      - name: version
+        in: path
+        required: true
+        description: The per-workflow version number, starting at 1.
+        schema: { type: integer, minimum: 1 }
+    get:
+      tags: [Workflows]
+      operationId: getWorkflowVersion
+      summary: Get one version
+      description: Requires `workflow:read`. Published and archived versions are byte-identical to what was published.
+      responses:
+        '200':
+          description: The version.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkflowVersion' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Workflows]
+      operationId: publishWorkflowVersion
+      summary: Publish a version
+      description: |
+        Requires `workflow:publish`, which is a **separate permission** from
+        `workflow:write` on purpose: publishing creates an immutable artefact that
+        real executions run against.
+
+        On publish, `workflows.currentVersionId` is repointed and any previous
+        `published` version becomes `archived`. **Executions already running are
+        not affected** — each execution is pinned to the `workflowVersionId` it
+        started with, permanently.
+
+        A version cannot be unpublished, only archived. Fixing a published
+        workflow means publishing a new version; the old one stays in history.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Published. `currentVersionId` now points here.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Workflow' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: The version is not a draft, or the current version changed since it was read.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                notDraft:
+                  value:
+                    type: https://automia.dev/problems/version-not-draft
+                    title: Version is not a draft
+                    status: 409
+                    code: VERSION_NOT_DRAFT
+                    detail: Version 7 is published and immutable. Create a new draft to make changes.
+                    traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+
+  # --- Executions ----------------------------------------------------------
+
+  /v1/organizations/{organizationId}/executions:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+    get:
+      tags: [Executions]
+      operationId: listExecutions
+      summary: List executions
+      description: |
+        Requires `execution:read`. Filterable. `state` accepts the values in
+        `ExecutionState`; `startedAfter` and `startedBefore` are ISO 8601
+        timestamps.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: workflowSlug
+          in: query
+          description: Only executions of this workflow.
+          schema: { type: string }
+        - name: state
+          in: query
+          description: Only executions in this state. Repeatable.
+          schema:
+            type: array
+            items: { $ref: '#/components/schemas/ExecutionState' }
+          style: form
+          explode: true
+        - name: triggerType
+          in: query
+          schema:
+            type: array
+            items: { $ref: '#/components/schemas/TriggerType' }
+          style: form
+          explode: true
+        - name: startedAfter
+          in: query
+          schema: { type: string, format: date-time }
+        - name: startedBefore
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Executions, newest first.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExecutionPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Executions]
+      operationId: triggerExecution
+      summary: Trigger a workflow
+      description: |
+        Requires `execution:trigger`. Returns `202` after the execution, its
+        `step_executions`, and the first dispatch are **committed** — it never waits
+        for a step to complete.
+
+        ## Idempotency
+
+        The `Idempotency-Key` header is **required** on this endpoint. A duplicate
+        execution is customer-visible and billable, so the burden of a safe retry
+        sits with the client that knows it retried.
+
+        A repeat of an identical request returns `200` with the **original**
+        execution and `Idempotency-Replayed: true`; the response body and
+        `Location` are identical to the first call. A repeat whose body differs
+        from the original for the same key is `422
+        IDEMPOTENCY_KEY_MISMATCH` — the key identified one request, and returning
+        the earlier result for a *different* request would be worse than an error.
+
+        "Run this workflow again" is a legitimate request, so it needs no special
+        endpoint: the client sends a **new** `Idempotency-Key` for what is
+        genuinely a new execution. Because the header is required, there is no
+        ambiguous case in which a retried call silently doubles a billable
+        execution.
+
+        ## What this does not guarantee
+
+        Once a step performs an external side effect, that effect is
+        **at-least-once** with respect to the customer's system. Each `http` and
+        `email` step sends `Idempotency-Key: exec:{executionId}:step:{nodeId}:g{generation}`
+        so the customer *can* deduplicate; honouring it is the customer's
+        obligation. See [ADR-007](../adr/007-idempotency-strategy.md) §4.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyRequired'
+        - $ref: '#/components/parameters/TraceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TriggerExecutionRequest' }
+            examples:
+              validateOrder:
+                summary: Trigger by slug
+                value:
+                  workflowSlug: order-fulfilment
+                  input:
+                    orderId: ord_9f3a2b
+                    priority: express
+              byVersion:
+                summary: Trigger a specific published version
+                value:
+                  workflowSlug: order-fulfilment
+                  version: 7
+                  input:
+                    orderId: ord_9f3a2b
+      responses:
+        '202':
+          description: Accepted and committed. The execution exists; no step has necessarily started.
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+            X-Trace-Id: { $ref: '#/components/headers/XTraceId' }
+            Idempotency-Replayed:
+              description: '`true` when this response was replayed from a stored `Idempotency-Key`.'
+              schema: { type: boolean }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Execution' }
+        '200':
+          description: |
+            A replay. The `Idempotency-Key` was already used for an identical
+            request, and the original execution is returned unchanged. Returned
+            with `Idempotency-Replayed: true`.
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+            Idempotency-Replayed: { $ref: '#/components/headers/IdempotencyReplayed' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Execution' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: The `Idempotency-Key` is still in progress from an earlier, identical request.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying.
+              schema: { type: integer, minimum: 1 }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                inProgress:
+                  value:
+                    type: https://automia.dev/problems/idempotency-key-in-progress
+                    title: A request with this Idempotency-Key is still in progress
+                    status: 409
+                    code: IDEMPOTENCY_KEY_IN_PROGRESS
+                    detail: An identical request with this key is still being processed. Retry after 2 seconds.
+                    traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+        '422':
+          description: |
+            The `Idempotency-Key` was already used for a **different** request
+            body, or the workflow has no published version.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                keyMismatch:
+                  value:
+                    type: https://automia.dev/problems/idempotency-key-mismatch
+                    title: Idempotency-Key was used with a different request
+                    status: 422
+                    code: IDEMPOTENCY_KEY_MISMATCH
+                    detail: This Idempotency-Key was used with a different request body. Use a new key.
+                    traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+                noPublishedVersion:
+                  value:
+                    type: https://automia.dev/problems/workflow-not-published
+                    title: Workflow has no published version
+                    status: 422
+                    code: WORKFLOW_NOT_PUBLISHED
+                    detail: 'Workflow "order-fulfilment" has only a draft. Publish a version before triggering.'
+                    traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/organizations/{organizationId}/executions/{executionId}:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+      - $ref: '#/components/parameters/ExecutionId'
+    get:
+      tags: [Executions]
+      operationId: getExecution
+      summary: Get an execution
+      description: |
+        Requires `execution:read`. Step outputs are omitted unless the caller also
+        holds `execution:secret-read`, because a step output can contain sensitive
+        data; in that case the JSON paths that look like credentials are listed
+        instead of their values
+        ([security.md](../architecture/security.md) §5.5).
+      responses:
+        '200':
+          description: The execution.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Execution' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/organizations/{organizationId}/executions/{executionId}/steps:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+      - $ref: '#/components/parameters/ExecutionId'
+    get:
+      tags: [Executions]
+      operationId: listExecutionSteps
+      summary: List an execution's steps
+      description: |
+        Requires `execution:read`. Every node of the pinned workflow version is
+        materialised up front, so this list is complete from the moment the
+        execution is created — including nodes that are still waiting on a
+        predecessor.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: state
+          in: query
+          schema:
+            type: array
+            items: { $ref: '#/components/schemas/StepState' }
+          style: form
+          explode: true
+      responses:
+        '200':
+          description: Steps, in graph order.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StepExecutionPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/organizations/{organizationId}/executions/{executionId}/steps/{stepId}:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+      - $ref: '#/components/parameters/ExecutionId'
+      - name: stepId
+        in: path
+        required: true
+        description: The `stepExecutionId`, not the node id from the definition.
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Executions]
+      operationId: getExecutionStep
+      summary: Get one step execution
+      description: |
+        Requires `execution:read`. `attemptsLog` is the full attempt history,
+        including the error class, outcome, and duration of each attempt, and is
+        the first thing to read when diagnosing a retried step.
+      responses:
+        '200':
+          description: The step execution.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StepExecution' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/organizations/{organizationId}/executions/{executionId}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+      - $ref: '#/components/parameters/ExecutionId'
+    post:
+      tags: [Executions]
+      operationId: cancelExecution
+      summary: Request cancellation
+      description: |
+        Requires `execution:operate`.
+
+        This is a **request**, not a guarantee, and the distinction is load-bearing:
+
+        - Steps already `RUNNING` are **not** interrupted. Cancellation is
+          cooperative: a worker checks `cancel_requested_at` at the next checkpoint.
+          An in-flight `http` call runs to completion or to its own timeout.
+        - Steps in `PENDING`, `READY`, or `QUEUED` are cancelled immediately.
+        - Steps in `SUCCEEDED` or `FAILED` are untouched. A side effect that
+          already happened is not undone; nothing rolls back.
+        - `TIMED_OUT` and `SUCCEEDED` executions cannot be cancelled — see the
+          `409` below.
+
+        The terminal `CANCELLED` state is reached once no step remains
+        non-terminal. Until then the execution stays in its current state with
+        `cancelRequestedAt` set, which is what the response reflects.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  maxLength: 500
+                  description: Recorded in the audit log and in `executions.cancel_reason`.
+      responses:
+        '202':
+          description: Cancellation requested. The execution will reach `CANCELLED` once in-flight steps settle.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Execution' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: The execution is already terminal, so it cannot be cancelled.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                notCancellable:
+                  value:
+                    type: https://automia.dev/problems/execution-not-cancellable
+                    title: Execution is not in a cancellable state
+                    status: 409
+                    code: EXECUTION_NOT_CANCELLABLE
+                    detail: Execution 8f2c1d90-… is SUCCEEDED. Only PENDING, RUNNING, WAITING and RETRYING executions can be cancelled.
+                    traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+
+  /v1/organizations/{organizationId}/executions/{executionId}/retry:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+      - $ref: '#/components/parameters/ExecutionId'
+    post:
+      tags: [Executions]
+      operationId: retryExecution
+      summary: Retry an execution
+      description: |
+        Requires `execution:operate`. Allowed from `FAILED`, `CANCELLED`, and
+        `TIMED_OUT` only — a `SUCCEEDED` execution is not an error, so retrying it
+        is a new run, not a retry.
+
+        ## This increments `generation`
+
+        `generation` starts at `0` and increments **only** here. That changes every
+        `externalKey` this execution's steps send:
+
+        ```text
+        run 1:      exec:{executionId}:step:{nodeId}:g0
+        after retry: exec:{executionId}:step:{nodeId}:g1
+        ```
+
+        Automatic recovery — a stalled job, a redelivery, a reconciler
+        re-dispatch — always reuses the same `generation`, so the customer system
+        deduplicates it and no double charge occurs. An **operator** retry increments
+        it, so the customer system treats it as the deliberate new attempt it is.
+        Without this distinction, one of the two would be silently swallowed.
+
+        This is also why a step's external side effect is **not** rolled back from
+        the previous run. A retry re-runs the work; where the effect should be
+        compensated, the workflow needs an explicit compensation path.
+
+        `stepIds` narrows the retry to specific steps. Omitting it retries every
+        non-successful step of the pinned version. Steps that already
+        `SUCCEEDED` are not re-run.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                stepIds:
+                  type: array
+                  description: Restrict the retry to these `stepExecutionId` values. Omit to retry every non-successful step.
+                  items: { type: string, format: uuid }
+                reason:
+                  type: string
+                  maxLength: 500
+      responses:
+        '202':
+          description: Retry accepted. `generation` has been incremented and the selected steps are back in `PENDING`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Execution' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: The execution is not in a retryable state.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                notRetryable:
+                  value:
+                    type: https://automia.dev/problems/execution-not-retryable
+                    title: Execution is not in a retryable state
+                    status: 409
+                    code: EXECUTION_NOT_RETRYABLE
+                    detail: Execution 8f2c1d90-… is SUCCEEDED. Only FAILED, CANCELLED and TIMED_OUT executions can be retried.
+                    traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+
+  # --- Step executions (flat) ----------------------------------------------
+
+  /v1/organizations/{organizationId}/step-executions:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+    get:
+      tags: [Executions]
+      operationId: listStepExecutions
+      summary: List step executions across executions
+      description: |
+        Requires `execution:read`. A flat view across executions, for operators
+        answering "which steps failed most often this week?". Intended for
+        operational investigation, not for building a UI, because it crosses
+        execution boundaries.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: executionId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: state
+          in: query
+          schema:
+            type: array
+            items: { $ref: '#/components/schemas/StepState' }
+          style: form
+          explode: true
+        - name: nodeType
+          in: query
+          schema:
+            type: array
+            items: { $ref: '#/components/schemas/StepType' }
+          style: form
+          explode: true
+        - name: errorClass
+          in: query
+          description: Filter by the classified failure reason.
+          schema: { $ref: '#/components/schemas/ErrorClass' }
+      responses:
+        '200':
+          description: Step executions.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StepExecutionPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # --- Webhook endpoints ---------------------------------------------------
+
+  /v1/organizations/{organizationId}/webhook-endpoints:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+    get:
+      tags: [Webhook endpoints]
+      operationId: listWebhookEndpoints
+      summary: List inbound webhook endpoints
+      description: Requires `webhook:read`.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Endpoints. The HMAC secret is never returned after creation.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookEndpointPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Webhook endpoints]
+      operationId: createWebhookEndpoint
+      summary: Create an inbound webhook endpoint
+      description: |
+        Requires `webhook:write`. The `signingSecret` is returned **only** in this
+        response.
+
+        `dedupStrategy` should be chosen deliberately:
+
+        - `event_id` (default) reads the external event id from the configured
+          `eventIdHeader` or JSON path, and
+          `UNIQUE (webhook_endpoint_id, external_event_id)` gives replay
+          protection **forever, per endpoint**. This is the strong option.
+        - `body_hash` has no stable event id available, so it falls back to hashing
+          the canonical body. Protection is limited to the ±5-minute timestamp
+          window, and the delivery row records the weaker strategy so it is
+          visible during incident review. The API response states this explicitly
+          rather than leaving it to be discovered.
+
+        Rate limiting is per endpoint and per source IP; exceeding it is `429`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateWebhookEndpointRequest' }
+      responses:
+        '201':
+          description: Created. Includes `publicId` and `signingSecret`; neither is retrievable again.
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CreatedWebhookEndpoint' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/UnprocessableContent' }
+
+  /v1/organizations/{organizationId}/webhook-endpoints/{webhookEndpointId}:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+      - name: webhookEndpointId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Webhook endpoints]
+      operationId: getWebhookEndpoint
+      summary: Get an endpoint
+      description: Requires `webhook:read`.
+      responses:
+        '200':
+          description: The endpoint.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookEndpoint' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Webhook endpoints]
+      operationId: updateWebhookEndpoint
+      summary: Update or disable an endpoint
+      description: |
+        Requires `webhook:write`. Set `enabled: false` to stop accepting
+        deliveries without deleting the endpoint or its history. Rotating the
+        secret accepts the `previous` secret for a window, so a rotation need not
+        cause downtime.
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema: { $ref: '#/components/schemas/UpdateWebhookEndpointRequest' }
+      responses:
+        '200':
+          description: The updated endpoint.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookEndpoint' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Webhook endpoints]
+      operationId: deleteWebhookEndpoint
+      summary: Delete an endpoint
+      description: Requires `webhook:write`. `webhook_deliveries` rows are retained for the audit trail.
+      responses:
+        '204': { description: Deleted. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/organizations/{organizationId}/webhook-endpoints/{webhookEndpointId}/deliveries:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+      - name: webhookEndpointId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Webhook endpoints]
+      operationId: listWebhookDeliveries
+      summary: List delivery attempts
+      description: |
+        Requires `webhook:read`. The evidence trail for "did your provider deliver
+        it?", including rejected deliveries, which record why verification failed
+        without storing the payload's secrets.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/WebhookDeliveryStatus' }
+      responses:
+        '200':
+          description: Deliveries, newest first.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookDeliveryPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # --- Schedules -----------------------------------------------------------
+
+  /v1/organizations/{organizationId}/schedules:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+    get:
+      tags: [Schedules]
+      operationId: listSchedules
+      summary: List schedules
+      description: Requires `schedule:read`.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Schedules.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SchedulePage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Schedules]
+      operationId: createSchedule
+      summary: Create a schedule
+      description: |
+        Requires `schedule:write`.
+
+        The recurrence rule and the **next due instant live in PostgreSQL**, not in
+        a Redis cron registry, so "when does this run next?" is answerable from the
+        system of record and a Redis flush does not lose the schedule.
+
+        If the scheduler is down when an occurrence comes due, the behaviour
+        depends on how far it got. An occurrence that was already committed as a
+        durable outbox row still fires on recovery. A slot that came due while the
+        ticker was down is **not** replayed: `nextRunAt` is recomputed from now and
+        the skip is counted in the `schedules.missed` metric, because replaying
+        every missed slot would turn a long outage into a burst of executions
+        against an already-sick downstream. Backfill is an explicit, manual act.
+
+        Every occurrence carries a unique
+        `dedup_key = sched:{scheduleId}:{scheduledForIso8601}`, so a redelivered
+        fire can never create a second execution for the same slot.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateScheduleRequest' }
+      responses:
+        '201':
+          description: Created.
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Schedule' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422':
+          description: The cron expression is invalid, or the referenced workflow has no published version.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/organizations/{organizationId}/schedules/{scheduleId}:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+      - name: scheduleId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Schedules]
+      operationId: getSchedule
+      summary: Get a schedule
+      description: Requires `schedule:read`.
+      responses:
+        '200':
+          description: The schedule.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Schedule' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Schedules]
+      operationId: updateSchedule
+      summary: Update a schedule
+      description: |
+        Requires `schedule:write`. Changing the rule recomputes `nextFireAt`.
+        Pausing keeps the schedule and its firing history; it stops new
+        firings.
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema: { $ref: '#/components/schemas/UpdateScheduleRequest' }
+      responses:
+        '200':
+          description: The updated schedule.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Schedule' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Schedules]
+      operationId: deleteSchedule
+      summary: Delete a schedule
+      description: Requires `schedule:write`. Executions already created are unaffected.
+      responses:
+        '204': { description: Deleted. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # --- Credentials ---------------------------------------------------------
+
+  /v1/organizations/{organizationId}/credentials:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+    get:
+      tags: [Credentials]
+      operationId: listCredentials
+      summary: List credentials
+      description: |
+        Requires `credential:read`. Only metadata is returned. `ciphertext` has
+        no serialiser, and **no endpoint can reveal a stored secret** — including
+        this one and the UI
+        ([security.md](../architecture/security.md) §5.2).
+      responses:
+        '200':
+          description: Credentials.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CredentialPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Credentials]
+      operationId: createCredential
+      summary: Store a credential
+      description: |
+        Requires `credential:write`. The secret is envelope-encrypted
+        immediately and never logged. Rotation is a `PUT` with a new secret; the
+        old ciphertext is overwritten and `credential.updated` is audited.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateCredentialRequest' }
+      responses:
+        '201':
+          description: Created. The secret is not echoed.
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Credential' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/UnprocessableContent' }
+
+  /v1/organizations/{organizationId}/credentials/{credentialId}:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+      - name: credentialId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    put:
+      tags: [Credentials]
+      operationId: rotateCredentialSecret
+      summary: Rotate a credential's secret
+      description: |
+        Requires `credential:write`. The platform re-encrypts on update. A step
+        already running with the previous secret may still use it; revocation is
+        checked immediately before each use, so a revoked credential makes a step
+        `FATAL` rather than retrying
+        ([security.md](../architecture/security.md) §5.3).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [secret]
+              properties:
+                secret: { type: string, minLength: 1, writeOnly: true }
+      responses:
+        '200':
+          description: Rotated. The secret is not echoed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Credential' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Credentials]
+      operationId: deleteCredential
+      summary: Delete a credential
+      description: |
+        Requires `credential:write`. A `409` is returned while any non-terminal
+        execution's pinned version still references it, because deleting it would
+        make those executions unable to run.
+      responses:
+        '204': { description: Deleted. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: A non-terminal execution's pinned workflow version still references this credential.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  # --- Audit ---------------------------------------------------------------
+
+  /v1/organizations/{organizationId}/audit-logs:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+    get:
+      tags: [Audit]
+      operationId: listAuditLogs
+      summary: Read the audit log
+      description: |
+        Requires `audit:read`. Append-only: there is no write, update, or delete
+        endpoint, and no principal can modify history through this API. Rows are
+        written in the **same transaction** as the action they describe, so an
+        action cannot succeed without its audit record.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: action
+          in: query
+          schema: { type: string }
+        - name: actorType
+          in: query
+          schema:
+            type: array
+            items: { $ref: '#/components/schemas/ActorType' }
+          style: form
+          explode: true
+        - name: occurredAfter
+          in: query
+          schema: { type: string, format: date-time }
+        - name: occurredBefore
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Audit rows, newest first.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuditLogPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # --- Authentication (brokered) -------------------------------------------
+
+  /v1/auth/{path}:
+    parameters:
+      - name: path
+        in: path
+        required: true
+        description: |
+          Better Auth's own route segment — `sign-in/email`, `sign-in/social`,
+          `sign-out`, `session`, `two-factor/…`, and so on.
+        schema: { type: string }
+    post:
+      tags: [Authentication]
+      operationId: betterAuthPost
+      summary: Better Auth — POST routes
+      description: |
+        **Brokered.** This path is owned by [Better Auth](https://www.better-auth.com/docs)'s
+        contract, not by Automia's authorization model. It is listed so that
+        clients can discover it, and it is deliberately **not** restated here as if
+        its semantics were ours.
+
+        Better Auth owns OAuth `state` and PKCE, password hashing, and session
+        issue, validation, and revocation. Automia owns organizations, memberships,
+        roles, permissions, and API keys. Authorization is never derived from a
+        Better Auth response
+        ([ADR-001](../adr/001-authentication-strategy.md)).
+
+        Sessions are set as an opaque token in a `__Host-sid` cookie with
+        `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`. The `__Host-` prefix makes
+        `Secure` and `Path=/` browser-enforced and forbids a `Domain` attribute.
+        **The token is never returned in a response body and never stored in
+        `localStorage`**, so an XSS bug is not an immediate full account takeover.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '200': { $ref: '#/components/responses/BrokeredAuthResponse' }
+        '201': { $ref: '#/components/responses/BrokeredAuthResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        default:
+          description: |
+            Better Auth's own error shape, which is **not** RFC 9457. Clients must
+            not assume Problem Details from this path.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+    get:
+      tags: [Authentication]
+      operationId: betterAuthGet
+      summary: Better Auth — GET routes
+      description: |
+        Brokered, as for the `POST` variant. `GET /v1/auth/session` is the
+        "who am I" call the dashboard uses; a `null` body means no valid session.
+      responses:
+        '200': { $ref: '#/components/responses/BrokeredAuthResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        default:
+          description: Better Auth's own error shape, not RFC 9457.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+
+  # --- Inbound webhooks (unauthenticated) ----------------------------------
+
+  /v1/webhooks/{publicId}:
+    parameters:
+      - name: publicId
+        in: path
+        required: true
+        description: |
+          A 128-bit random public identifier, distinct from the internal id. There
+          is deliberately **no lookup by organization slug**, so endpoints cannot be
+          enumerated.
+        schema: { type: string, minLength: 20, maxLength: 64 }
+      - name: X-Automia-Id
+        in: header
+        required: false
+        description: |
+          The provider's delivery id. Treated as the external `event_id` when the
+          endpoint's `dedupStrategy` is `event_id`, because a provider retry
+          reuses it.
+        schema: { type: string, maxLength: 255 }
+      - name: X-Automia-Timestamp
+        in: header
+        required: true
+        description: Unix seconds. Must be within ±5 minutes of server time; **to be confirmed by tests** against clock skew.
+        schema: { type: integer }
+      - name: X-Automia-Signature
+        in: header
+        required: true
+        description: '`v1=<hex>`, where hex is `HMAC-SHA256(endpoint_secret, "{timestamp}.v1.{raw_body_bytes}")`.'
+        schema: { type: string, pattern: '^v1=[0-9a-f]{64}$' }
+    post:
+      tags: [Webhooks]
+      operationId: receiveWebhook
+      summary: Inbound trigger
+      description: |
+        The unauthenticated, internet-facing entry point for triggering a
+        workflow. It is authenticated by a **signature**, not by a session or API
+        key.
+
+        ## Verification order
+
+        1. Size the body against the cap, then compute the HMAC over the **raw
+           bytes** and compare with `crypto.timingSafeEqual`. An unsigned flood must
+           cost only a hash, so verification happens before any database write.
+        2. Check the timestamp window.
+        3. Parse the body and validate against the endpoint's schema.
+        4. `INSERT INTO webhook_deliveries` — a unique violation on
+           `(webhook_endpoint_id, external_event_id)` means a replay.
+        5. Insert the execution with
+           `dedup_key = hook:{endpointId}:{externalEventId}` via
+           `ON CONFLICT (dedup_key) DO NOTHING`, plus its `step_executions` and
+           `outbox_events`.
+        6. Commit, then respond `202`. **Never** wait for the execution to run —
+           a provider's timeout must not be able to cause a duplicate accept.
+
+        ## Response codes are deliberately coarse
+
+        | Code | Meaning | Leaks |
+        |---|---|---|
+        | `202` | Accepted; an execution exists, or already existed for this `event_id` | Nothing |
+        | `200` | Duplicate. Replay protection fired; no new execution | Nothing |
+        | `401` | Signature or timestamp failure | Whether the endpoint exists |
+        | `400` | Body failed the endpoint's schema | Nothing |
+        | `429` | Per-endpoint or per-source-IP rate limit | Nothing |
+
+        A duplicate is `200` rather than `202` so a provider can tell a
+        redelivery from a fresh accept without inspecting the body — and the
+        response body is identical in both cases, so it reveals nothing about the
+        workflow, the tenant, or whether the first accept produced an execution.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '202':
+          description: Accepted. An execution was committed and will run.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  received: { type: boolean, const: true }
+                required: [received]
+        '200':
+          description: |
+            Duplicate. This `event_id` was already accepted for this endpoint;
+            **no new execution was created** and the original is unaffected.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  received: { type: boolean, const: true }
+                  duplicate: { type: boolean, const: true }
+                required: [received, duplicate]
+        '400':
+          description: The body does not match the endpoint's schema. Recorded as `REJECTED_INVALID_PAYLOAD`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401':
+          description: |
+            Signature or timestamp verification failed. Recorded as `REJECTED` with
+            a reason; the payload is not stored.
+          headers:
+            WWW-Authenticate:
+              description: The challenge presented.
+              schema: { type: string }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                badSignature:
+                  value:
+                    type: https://automia.dev/problems/invalid-signature
+                    title: Signature verification failed
+                    status: 401
+                    code: INVALID_SIGNATURE
+                    detail: The X-Automia-Signature header did not verify against this endpoint's secret.
+                    traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+                staleTimestamp:
+                  value:
+                    type: https://automia.dev/problems/stale-timestamp
+                    title: Timestamp outside the accepted window
+                    status: 401
+                    code: STALE_TIMESTAMP
+                    detail: The X-Automia-Timestamp is outside the ±5 minute window.
+                    traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+        '429':
+          description: Rate limited, per endpoint or per source IP.
+          headers:
+            Retry-After: { $ref: '#/components/headers/RetryAfter' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  # --- Health --------------------------------------------------------------
+
+  /health/live:
+    get:
+      tags: [Health]
+      operationId: liveness
+      summary: Liveness
+      description: |
+        Returns `200` if the process is running. Deliberately does **not** check
+        PostgreSQL or Redis: a liveness probe that fails on a dependency will get
+        the pod killed, which does not fix the dependency and turns a partial
+        outage into a restart loop.
+      security: []
+      responses:
+        '200':
+          description: Alive.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+  /health/ready:
+    get:
+      tags: [Health]
+      operationId: readiness
+      summary: Readiness
+      description: |
+        Returns `200` only when the process can serve traffic, which for `apps/api`
+        means PostgreSQL is reachable. Redis is **not** required for the API: the
+        API accepts executions and commits them regardless, so a Redis outage must
+        not take the API out of rotation.
+      security: []
+      responses:
+        '200':
+          description: Ready.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+        '503':
+          description: Not ready. A dependent service is unreachable.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+
+# ---------------------------------------------------------------------------
+# Components
+# ---------------------------------------------------------------------------
+
+components:
+
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: __Host-sid
+      description: |
+        Opaque session token issued by Better Auth. The `__Host-` prefix means
+        browsers enforce `Secure` and `Path=/` and forbid a `Domain` attribute
+        ([security.md](../architecture/security.md) §2.3).
+
+        CSRF is defended by `SameSite=Lax` **and** mandatory `Origin`/`Referer`
+        validation on unsafe methods. Cookies are sent automatically by the
+        browser, so a cross-site form post is the threat and both controls target
+        it.
+    apiKeyBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: Automia API key
+      description: |
+        `Authorization: Bearer ak_live_{prefix}_{secret}`.
+
+        The 8-character prefix is indexed and safe to log; the 32-character secret
+        is stored as an Argon2id hash with a per-row salt and is verified in
+        constant time. A database read therefore does not yield a usable
+        credential.
+
+        A key is scoped to one organization and carries a subset of the
+        organization's permissions. **A key can never change the membership that
+        authorises it.**
+    betterAuthBearer:
+      type: http
+      scheme: bearer
+      description: Session token in the `Authorization` header, for non-browser clients. Lower preference than the cookie.
+
+  parameters:
+    OrganizationId:
+      name: organizationId
+      in: path
+      required: true
+      description: |
+        The organization being addressed. Membership and role are read from this
+        organization, not from any body field — a client-supplied role is never
+        honoured.
+      schema: { type: string, format: uuid }
+    WorkflowSlug:
+      name: workflowSlug
+      in: path
+      required: true
+      description: Stable, human-readable, unique within the organization. Used in preference to the id so URLs survive a rename of the display name.
+      schema: { type: string, minLength: 1, maxLength: 64, pattern: '^[a-z0-9][a-z0-9-]*$' }
+    ExecutionId:
+      name: executionId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ApiKeyId:
+      name: apiKeyId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Limit:
+      name: limit
+      in: query
+      description: Page size.
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    Cursor:
+      name: cursor
+      in: query
+      description: Opaque cursor from the previous page's `page.nextCursor`. Must not be parsed or constructed.
+      schema: { type: string, maxLength: 512 }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Client-chosen key making a retry of this request safe. Retained for
+        **24 hours**; after that a repeat key creates a new record, which is
+        documented behaviour rather than a guarantee.
+
+        Reuse with a **different** body is `422 IDEMPOTENCY_KEY_MISMATCH`, never a
+        silent execution of the new body under the old key.
+      schema: { type: string, minLength: 8, maxLength: 255 }
+    IdempotencyKeyRequired:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Required on execution creation. A duplicate execution is customer-visible
+        and billable, so a safe retry is the client's responsibility and the header
+        is how it is expressed.
+      schema: { type: string, minLength: 8, maxLength: 255 }
+    IfMatch:
+      name: If-Match
+      in: header
+      required: false
+      description: The draft's current `definitionHash`, to detect a concurrent edit. Sent as a bare hash, not an ETag.
+      schema: { type: string, minLength: 64, maxLength: 64, pattern: '^[0-9a-f]{64}$' }
+    TraceId:
+      name: X-Trace-Id
+      in: header
+      required: false
+      description: Client-supplied trace id, adopted if valid. Propagated to logs, traces, and audit rows.
+      schema: { type: string, maxLength: 64 }
+
+  headers:
+    Location:
+      description: The canonical URL of the created or affected resource.
+      schema: { type: string, format: uri-reference }
+    RetryAfter:
+      description: Seconds to wait before retrying.
+      schema: { type: integer, minimum: 1 }
+    XTraceId:
+      description: The trace id for this request, also present in logs and traces. Quote it in a support request.
+      schema: { type: string }
+    XRateLimitRemaining:
+      description: Requests remaining in the current window.
+      schema: { type: integer, minimum: 0 }
+    IdempotencyReplayed:
+      description: '`true` when the response was replayed from a stored `Idempotency-Key` rather than newly computed.'
+      schema: { type: boolean }
+
+  responses:
+    BadRequest:
+      description: Malformed request. The `type` names the problem.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          examples:
+            invalidBody:
+              value:
+                type: https://automia.dev/problems/malformed-request
+                title: Request body failed validation
+                status: 400
+                code: MALFORMED_REQUEST
+                detail: 'body/workflowSlug: must be a string matching ^[a-z0-9][a-z0-9-]*$'
+                traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+    Unauthorized:
+      description: No credential, or the credential is invalid or expired.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          examples:
+            noSession:
+              value:
+                type: https://automia.dev/problems/unauthenticated
+                title: Authentication required
+                status: 401
+                code: UNAUTHENTICATED
+                detail: No valid session or API key was presented.
+                traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+    Forbidden:
+      description: |
+        Authenticated, but the required permission is missing **within your own
+        organization**. A resource in another organization returns `404` instead,
+        so this status never confirms that a cross-tenant resource exists.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          examples:
+            missingPermission:
+              value:
+                type: https://automia.dev/problems/permission-denied
+                title: Permission denied
+                status: 403
+                code: PERMISSION_DENIED
+                detail: This action requires the workflow:publish permission, which your role does not grant.
+                traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+    NotFound:
+      description: |
+        The resource does not exist, **or belongs to another organization**. These
+        two are deliberately indistinguishable, so `404` cannot be used to probe
+        for the existence of another tenant's resources
+        ([security.md](../architecture/security.md) §4.4).
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          examples:
+            missing:
+              value:
+                type: https://automia.dev/problems/not-found
+                title: Not found
+                status: 404
+                code: NOT_FOUND
+                detail: No such resource.
+                traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+    UnprocessableContent:
+      description: The request was well-formed but semantically invalid.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    TooManyRequests:
+      description: Rate limited. Rate limits are per organization, per principal, and per API key.
+      headers:
+        Retry-After: { $ref: '#/components/headers/RetryAfter' }
+        X-RateLimit-Remaining: { $ref: '#/components/headers/XRateLimitRemaining' }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    BrokeredAuthResponse:
+      description: |
+        Better Auth's own response shape. **Not** RFC 9457 and not normalised into
+        Problem Details, because restating another library's contract as ours would
+        create two things to keep consistent where one is correct.
+      content:
+        application/json:
+          schema: { type: object, additionalProperties: true }
+      headers:
+        Set-Cookie:
+          description: The `__Host-sid` session cookie, on sign-in.
+          schema: { type: string }
+
+  schemas:
+
+    # --- Enumerations ------------------------------------------------------
+
+    Role:
+      type: string
+      description: |
+        A convenience for humans. Guards check **permissions**, not role names, so
+        adding a role later does not require touching call sites.
+      enum: [OWNER, ADMIN, DEVELOPER, OPERATOR, VIEWER]
+
+    Permission:
+      type: string
+      description: |
+        The unit guards actually check. `workflow:publish` is separate from
+        `workflow:write` because publishing creates an immutable artefact that real
+        executions run against.
+      enum:
+        - organization:read
+        - organization:update
+        - organization:delete
+        - membership:read
+        - membership:write
+        - workflow:read
+        - workflow:write
+        - workflow:publish
+        - workflow:delete
+        - execution:read
+        - execution:trigger
+        - execution:operate
+        - credential:read
+        - credential:write
+        - apikey:read
+        - apikey:write
+        - webhook:read
+        - webhook:write
+        - schedule:read
+        - schedule:write
+        - audit:read
+        - execution:secret-read
+
+    ExecutionState:
+      type: string
+      description: |
+        **Derived, not assigned.** `executions.state` is a function of the step
+        states plus the cancellation and timeout flags; nothing writes it
+        directly. That is what makes "the execution says one thing and the steps
+        say another" structurally impossible.
+
+        `PENDING` is only ever a creation state. An operator retry does **not**
+        return an execution to `PENDING` — it goes to `RUNNING`, and completed
+        sibling steps stay completed.
+      enum: [PENDING, RUNNING, WAITING, RETRYING, SUCCEEDED, FAILED, CANCELLED, TIMED_OUT]
+      examples: [RUNNING]
+
+    StepState:
+      type: string
+      description: |
+        `PENDING` as a *reachable-blocked* state means "waiting for a predecessor",
+        which is what makes the join rule expressible.
+
+        `SKIPPED` is required for DAG execution: a branch pruned by a `condition` or
+        `failure` edge that was not taken must reach a terminal state, or
+        completion detection can never terminate.
+
+        | From | To | Legal |
+        |---|---|---|
+        | — | `PENDING`, `READY` | On creation |
+        | `PENDING` | `READY`, `SKIPPED`, `CANCELLED`, `TIMED_OUT` | Predecessors satisfied, or pruned, or cancelled |
+        | `READY` | `QUEUED`, `SKIPPED`, `CANCELLED`, `TIMED_OUT` | Dispatched, or pruned |
+        | `QUEUED` | `RUNNING`, `CANCELLED`, `TIMED_OUT` | Claimed by a worker |
+        | `RUNNING` | `SUCCEEDED`, `FAILED`, `RETRYING`, `CANCELLED`, `TIMED_OUT` | Terminal, retry, or interrupted |
+        | `RETRYING` | `QUEUED`, `FAILED`, `CANCELLED`, `TIMED_OUT` | `available_at` reached, or attempts exhausted |
+        | any terminal | — | **No.** Terminal is terminal. Operator retry creates a new `generation` rather than reopening a step. |
+      enum: [PENDING, READY, QUEUED, RUNNING, RETRYING, SUCCEEDED, FAILED, SKIPPED, CANCELLED, TIMED_OUT]
+      examples: [QUEUED]
+
+    StepType:
+      type: string
+      description: |
+        The **entire** set of things a tenant can make a worker do. It is four
+        types, and that is a security property as much as a design one: the
+        registry is small enough to enumerate and review exhaustively, which is
+        what makes the SSRF controls on `http` comprehensive.
+
+        `webhook`, `database`, `transform`, `parallel`, `join` and `subworkflow`
+        are **Proposed**, not designed, and are rejected by the validator.
+      enum: [http, condition, delay, email]
+      examples: [http]
+
+    EdgeCondition:
+      type: string
+      description: |
+        A node's successors are exactly the edges whose condition its terminal
+        state satisfies. There is no `condition` *node* type, and no
+        `parallel`/`join` node type in v1.
+      enum: [success, failure, always]
+      examples: [success]
+
+    ErrorPolicy:
+      type: string
+      description: |
+        What happens to the rest of the graph when a step reaches `FAILED` or
+        `TIMED_OUT`.
+      enum: [fail-fast, continue]
+      default: fail-fast
+
+    TriggerType:
+      type: string
+      enum: [api, webhook, schedule, retry, manual]
+
+    ErrorClass:
+      type: string
+      description: |
+        Why a step failed, classified. `RETRYABLE` is decided by the step type's
+        `retry.retryOn` list plus transient conditions; `FATAL` is never retried.
+      enum:
+        - TIMEOUT
+        - TRANSPORT
+        - HTTP_STATUS
+        - RATE_LIMITED
+        - VALIDATION
+        - CONFIGURATION
+        - SSRF_BLOCKED
+        - CREDENTIAL_REVOKED
+        - CANCELLED
+        - INTERNAL
+      examples: [HTTP_STATUS]
+
+    ActorType:
+      type: string
+      enum: [user, api_key, system, scheduler, worker]
+
+    WebhookDeliveryStatus:
+      type: string
+      description: |
+        `REJECTED` rows record verification failures and store the **reason, not
+        the payload**, because an unverified body must not be retained.
+      enum: [ACCEPTED, DUPLICATE, REJECTED, REJECTED_INVALID_PAYLOAD, REJECTED_RATE_LIMITED]
+      examples: [ACCEPTED]
+
+    RolePermissions:
+      type: object
+      description: The permissions a role grants, for display in the UI. Enforcement is server-side regardless.
+      properties:
+        role: { $ref: '#/components/schemas/Role' }
+        permissions:
+          type: array
+          items: { $ref: '#/components/schemas/Permission' }
+
+    # --- Common envelopes --------------------------------------------------
+
+    Problem:
+      type: object
+      description: |
+        RFC 9457 Problem Document, plus a stable `code` and a `traceId`. The
+        `code` is the contract; `title` and `detail` are for humans and may
+        change.
+      required: [type, title, status, code]
+      properties:
+        type:
+          type: string
+          format: uri
+          description: A URI reference identifying the problem type. Dereferenceable in future.
+          examples: ['https://automia.dev/problems/execution-not-retryable']
+        title:
+          type: string
+          description: A short, human-readable summary. Does not change between occurrences of the problem type.
+          examples: ['Execution is not in a retryable state']
+        status:
+          type: integer
+          description: The HTTP status code, repeated for convenience.
+          examples: [409]
+        code:
+          type: string
+          description: |
+            The stable machine-readable identifier. **Branch on this, not on
+            `title` or `detail`.**
+          pattern: '^[A-Z][A-Z0-9_]*$'
+          examples: [EXECUTION_NOT_RETRYABLE]
+        detail:
+          type: string
+          description: |
+            An explanation written for an API consumer. Contains no stack traces,
+            SQL text, file paths, or internal hostnames.
+          examples: ['Execution 8f2c1d90-… is SUCCEEDED. Only FAILED, CANCELLED and TIMED_OUT executions can be retried.']
+        instance:
+          type: string
+          format: uri
+          description: A URI reference identifying this specific occurrence.
+        traceId:
+          type: string
+          description: |
+            The correlation id, present in our logs and traces. Quote it in a
+            support request — it is the supported support path, and it exists so
+            that internals never have to be returned to a caller.
+          examples: ['4bf92f3577b34da6a3ce929d0e0e4736']
+        errors:
+          type: array
+          description: Field-level details, for validation failures.
+          items: { $ref: '#/components/schemas/ValidationError' }
+      additionalProperties: false
+
+    ValidationError:
+      type: object
+      required: [path, message]
+      properties:
+        path:
+          type: string
+          description: JSON Pointer into the request body.
+          examples: ['/nodes/2/type']
+        message: { type: string }
+        code: { type: string, pattern: '^[A-Z][A-Z0-9_]*$' }
+
+    CursorPage:
+      type: object
+      description: Cursor pagination. Opaque cursors, because these tables are append-heavy and offset pagination degrades on them.
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items: {}
+        page:
+          type: object
+          required: [hasMore]
+          properties:
+            hasMore: { type: boolean }
+            nextCursor:
+              type: [string, 'null']
+              description: Pass as `cursor` to fetch the next page. `null` when `hasMore` is `false`.
+            limit: { type: integer }
+
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [ok, degraded, unavailable] }
+        version: { type: string }
+        uptimeSeconds: { type: integer }
+        checks:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              status: { type: string, enum: [ok, unavailable, skipped] }
+              detail: { type: string }
+      additionalProperties: false
+
+    # --- Organizations and members -----------------------------------------
+
+    Organization:
+      type: object
+      required: [id, slug, name, role, createdAt, updatedAt]
+      properties:
+        id: { type: string, format: uuid }
+        slug:
+          type: string
+          description: Stable and unique. Appears in URLs, so it does not change with a display-name edit.
+        name: { type: string }
+        role:
+          allOf: [{ $ref: '#/components/schemas/Role' }]
+          description: The **caller's** role in this organization. Advisory; the server enforces permissions.
+        settings:
+          type: object
+          additionalProperties: true
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+      additionalProperties: false
+
+    CreateOrganizationRequest:
+      type: object
+      required: [name, slug]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 120 }
+        slug: { type: string, minLength: 1, maxLength: 64, pattern: '^[a-z0-9][a-z0-9-]*$' }
+      additionalProperties: false
+
+    UpdateOrganizationRequest:
+      type: object
+      description: Merge patch. Only the fields present are changed.
+      properties:
+        name: { type: string, minLength: 1, maxLength: 120 }
+        settings: { type: object, additionalProperties: true }
+      additionalProperties: false
+
+    OrganizationPage:
+      allOf:
+        - $ref: '#/components/schemas/CursorPage'
+        - type: object
+          properties:
+            data:
+              type: array
+              items: { $ref: '#/components/schemas/Organization' }
+
+    Member:
+      type: object
+      required: [userId, role, status, createdAt]
+      properties:
+        userId: { type: string, format: uuid }
+        email: { type: string, format: email }
+        name: { type: [string, 'null'] }
+        role: { $ref: '#/components/schemas/Role' }
+        status: { type: string, enum: [active, invited, suspended] }
+        createdAt: { type: string, format: date-time }
+      additionalProperties: false
+
+    MembershipInvitation:
+      type: object
+      required: [id, email, role, status, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        role: { $ref: '#/components/schemas/Role' }
+        status: { type: string, enum: [pending, accepted, revoked, expired] }
+        inviteToken:
+          type: string
+          description: Present **only** in the creation response. Never retrievable again.
+          writeOnly: false
+        expiresAt: { type: string, format: date-time }
+        createdAt: { type: string, format: date-time }
+      additionalProperties: false
+
+    CreateInvitationRequest:
+      type: object
+      required: [email, role]
+      properties:
+        email: { type: string, format: email }
+        role:
+          allOf: [{ $ref: '#/components/schemas/Role' }]
+          description: A role, never a permission set. A client cannot grant permissions the role does not carry.
+      additionalProperties: false
+
+    MemberPage:
+      allOf:
+        - $ref: '#/components/schemas/CursorPage'
+        - type: object
+          properties:
+            data:
+              type: array
+              items: { $ref: '#/components/schemas/Member' }
+
+    # --- API keys ----------------------------------------------------------
+
+    ApiKey:
+      type: object
+      description: Metadata only. The secret is an Argon2id hash at rest and is not retrievable by any endpoint.
+      required: [id, name, keyPrefix, scopes, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        keyPrefix:
+          type: string
+          description: The 8-character indexed prefix. Not a secret; safe to display and to log.
+          examples: ['ak_live_7Kf3nQ2x']
+        scopes:
+          type: array
+          description: |
+            An explicit subset of the organization's permissions. A key can never
+            exceed the permissions of the membership that created it, and can
+            never change it.
+          items: { $ref: '#/components/schemas/Permission' }
+        lastUsedAt:
+          type: [string, 'null']
+          format: date-time
+          description: For detecting a key nobody is using, and for incident scoping.
+        revokedAt: { type: [string, 'null'], format: date-time }
+        expiresAt: { type: [string, 'null'], format: date-time }
+        createdAt: { type: string, format: date-time }
+      additionalProperties: false
+
+    CreatedApiKey:
+      allOf:
+        - $ref: '#/components/schemas/ApiKey'
+        - type: object
+          required: [key]
+          properties:
+            key:
+              type: string
+              description: |
+                The full key, `ak_live_{prefix}_{secret}`. Present in this
+                response **only**. It is not recoverable afterwards.
+              writeOnly: false
+
+    CreateApiKeyRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        scopes:
+          type: array
+          description: Defaults to the creator's full permission set. Narrow it.
+          items: { $ref: '#/components/schemas/Permission' }
+        expiresAt: { type: [string, 'null'], format: date-time }
+      additionalProperties: false
+
+    ApiKeyPage:
+      allOf:
+        - $ref: '#/components/schemas/CursorPage'
+        - type: object
+          properties:
+            data:
+              type: array
+              items: { $ref: '#/components/schemas/ApiKey' }
+
+    # --- Workflows ---------------------------------------------------------
+
+    WorkflowDefinition:
+      type: object
+      description: |
+        The workflow document. **Data, never code** — the largest untrusted input
+        the system accepts, and the reason a tenant cannot escalate by publishing
+        a workflow ([security.md](../architecture/security.md) §1.4).
+
+        An execution is pinned to the version it was triggered with, permanently.
+        Editing or publishing a workflow never affects runs already in flight.
+      required: [nodes, edges]
+      properties:
+        schemaVersion:
+          type: integer
+          minimum: 1
+          default: 1
+          description: The **format** version, not the workflow version. Old documents must stay executable.
+        errorPolicy:
+          allOf: [{ $ref: '#/components/schemas/ErrorPolicy' }]
+          description: 'Defaults to `fail-fast`.'
+        timeoutMs:
+          type: integer
+          minimum: 1
+          description: Whole-execution budget. When it elapses, non-terminal steps become `TIMED_OUT`.
+        nodes:
+          type: array
+          minItems: 1
+          maxItems: 500
+          items: { $ref: '#/components/schemas/WorkflowNode' }
+        edges:
+          type: array
+          items: { $ref: '#/components/schemas/WorkflowEdge' }
+      additionalProperties: false
+
+    WorkflowNode:
+      oneOf:
+        - $ref: '#/components/schemas/HttpWorkflowNode'
+        - $ref: '#/components/schemas/EmailWorkflowNode'
+        - $ref: '#/components/schemas/DelayWorkflowNode'
+        - $ref: '#/components/schemas/ConditionWorkflowNode'
+      discriminator:
+        propertyName: type
+        mapping:
+          http: '#/components/schemas/HttpWorkflowNode'
+          email: '#/components/schemas/EmailWorkflowNode'
+          delay: '#/components/schemas/DelayWorkflowNode'
+          condition: '#/components/schemas/ConditionWorkflowNode'
+      description: |
+        One node. `config` is **bound to `type`** by the discriminator, so a
+        `delay` node cannot carry an `http` config and a misspelled config key is a
+        validation error rather than a silently ignored setting.
+
+        All four shapes share `id`, `type`, and `timeoutMs`.
+      properties:
+        id:
+          type: string
+          pattern: '^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$'
+          description: |
+            Stable and unique within the document. It appears in the external
+            idempotency key, so renaming it changes the key — which is why nodes
+            are never renamed in a published version.
+        timeoutMs:
+          type: integer
+          minimum: 1
+          description: Per-node budget, bounded by the execution's remaining budget.
+
+    WorkflowNodeBase:
+      type: object
+      required: [id, type]
+      properties:
+        id:
+          type: string
+          pattern: '^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$'
+          description: |
+            Stable and unique within the document. It appears in the external
+            idempotency key, so renaming it changes the key — which is why nodes
+            are never renamed in a published version.
+        timeoutMs:
+          type: integer
+          minimum: 1
+          description: Per-node budget, bounded by the execution's remaining budget.
+
+    HttpWorkflowNode:
+      allOf:
+        - $ref: '#/components/schemas/WorkflowNodeBase'
+        - type: object
+          required: [type, config]
+          properties:
+            type: { const: http }
+            config: { $ref: '#/components/schemas/HttpNodeConfig' }
+
+    EmailWorkflowNode:
+      allOf:
+        - $ref: '#/components/schemas/WorkflowNodeBase'
+        - type: object
+          required: [type, config]
+          properties:
+            type: { const: email }
+            config: { $ref: '#/components/schemas/EmailNodeConfig' }
+
+    DelayWorkflowNode:
+      allOf:
+        - $ref: '#/components/schemas/WorkflowNodeBase'
+        - type: object
+          required: [type, config]
+          properties:
+            type: { const: delay }
+            config: { $ref: '#/components/schemas/DelayNodeConfig' }
+
+    ConditionWorkflowNode:
+      allOf:
+        - $ref: '#/components/schemas/WorkflowNodeBase'
+        - type: object
+          required: [type, config]
+          properties:
+            type: { const: condition }
+            config: { $ref: '#/components/schemas/ConditionNodeConfig' }
+
+    WorkflowEdge:
+      type: object
+      required: [source, target]
+      description: |
+        Edges carry the condition, and a node's successors are exactly the edges
+        whose condition its terminal state satisfies. This is what makes pruning
+        and joins expressible without a `condition` node type.
+      properties:
+        source: { type: string }
+        target: { type: string }
+        condition:
+          allOf: [{ $ref: '#/components/schemas/EdgeCondition' }]
+          description: 'Defaults to `success`.'
+      additionalProperties: false
+
+    HttpNodeConfig:
+      type: object
+      description: 'Config for `type: http`. Validated at write time, and again at request time.'
+      required: [method, url]
+      properties:
+        method: { type: string, enum: [GET, POST, PUT, PATCH, DELETE, HEAD] }
+        url:
+          type: string
+          format: uri
+          description: |
+            `https` only, or `http` to a tenant-allowlisted host. Literal IPs must
+            be globally routable. No userinfo.
+        headers:
+          type: object
+          additionalProperties: { type: string }
+          description: |
+            Credentials are **not** placed here. Reference a `credentials` id; it
+            is resolved at execution time from envelope-encrypted storage.
+        body: {}
+        credentialId:
+          type: string
+          format: uuid
+          description: Resolved immediately before each use. A revoked credential makes the step `FATAL`, not retried.
+        timeoutMs: { type: integer, minimum: 1 }
+        followRedirects:
+          type: boolean
+          default: true
+          description: |
+            Every hop is revalidated against the egress policy and the redirect
+            count is capped, because a naive SSRF check that ignores redirects is
+            trivially bypassed.
+        retry:
+          type: object
+          description: Retry policy lives in `config`, because only the step type knows what a retryable failure is.
+          properties:
+            maxAttempts: { type: integer, minimum: 1, maximum: 20, default: 3 }
+            baseDelayMs: { type: integer, minimum: 1, default: 1000 }
+            maxDelayMs: { type: integer, minimum: 1, default: 60000 }
+            retryOn:
+              type: array
+              description: HTTP status codes that are retryable. Everything else is `FATAL`.
+              items: { type: integer }
+      additionalProperties: false
+
+    EmailNodeConfig:
+      type: object
+      description: 'Config for `type: email`.'
+      required: [to, subject, body]
+      properties:
+        to: { type: string }
+        subject: { type: string }
+        body: { type: string }
+        from: { type: string }
+        credentialId: { type: string, format: uuid }
+        retry:
+          type: object
+          properties:
+            maxAttempts: { type: integer, minimum: 1, maximum: 20, default: 3 }
+            baseDelayMs: { type: integer, minimum: 1, default: 1000 }
+            maxDelayMs: { type: integer, minimum: 1, default: 60000 }
+      additionalProperties: false
+
+    DelayNodeConfig:
+      type: object
+      description: |
+        Config for `type: delay`. The wait is a row with an `available_at` in
+        PostgreSQL, **not** a delayed job in Redis, so a Redis flush costs nothing
+        and the API can answer "when does this resume?".
+      required: [durationMs]
+      properties:
+        durationMs: { type: integer, minimum: 1, maximum: 2592000000 }
+      additionalProperties: false
+
+    ConditionNodeConfig:
+      type: object
+      description: |
+        Config for `type: condition`. Pure evaluation against stored step outputs;
+        it performs no I/O, and the expression language is deliberately **closed
+        and total** — there is no user-supplied executable content.
+      required: [expression]
+      properties:
+        expression:
+          type: string
+          description: A comparison over `{{ ... }}` references resolved against stored outputs, never against a runtime.
+      additionalProperties: false
+
+    WorkflowVersion:
+      type: object
+      description: |
+        One immutable version. `published` and `archived` versions never change,
+        which is what allows the definition to be cached in process memory
+        indefinitely and makes an in-flight execution impossible to invalidate.
+      required: [id, version, status, definitionHash, createdAt, createdBy]
+      properties:
+        id: { type: string, format: uuid }
+        version:
+          type: integer
+          minimum: 1
+          description: Dense and per-workflow, starting at 1. This is what a human reads in a UI.
+        status: { type: string, enum: [draft, published, archived] }
+        definition:
+          allOf: [{ $ref: '#/components/schemas/WorkflowDefinition' }]
+          description: Present unless the request set `includeDefinition=false`.
+        definitionHash:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: |
+            SHA-256 over a canonical form (object keys sorted, nodes sorted by
+            `id`), so semantically identical documents hash identically. Drives
+            no-op deduplication, so editing and reverting does not consume a
+            version number.
+        createdBy: { type: string, format: uuid }
+        createdAt: { type: string, format: date-time }
+        publishedAt: { type: [string, 'null'], format: date-time }
+      additionalProperties: false
+
+    Workflow:
+      type: object
+      required: [id, slug, name, currentVersionId, createdAt, updatedAt]
+      properties:
+        id: { type: string, format: uuid }
+        slug: { type: string }
+        name: { type: string }
+        description: { type: [string, 'null'] }
+        currentVersionId:
+          type: [string, 'null']
+          format: uuid
+          description: The version new triggers resolve against. `null` while nothing has been published.
+        latestVersion: { $ref: '#/components/schemas/WorkflowVersion' }
+        draft:
+          allOf: [{ $ref: '#/components/schemas/WorkflowVersion' }]
+          description: The editable draft, if one exists. Absent when the latest version is already published.
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+      additionalProperties: false
+
+    CreateWorkflowRequest:
+      type: object
+      required: [slug, name, definition]
+      properties:
+        slug: { type: string, minLength: 1, maxLength: 64, pattern: '^[a-z0-9][a-z0-9-]*$' }
+        name: { type: string, minLength: 1, maxLength: 120 }
+        description: { type: string, maxLength: 1000 }
+        definition: { $ref: '#/components/schemas/WorkflowDefinition' }
+      additionalProperties: false
+
+    UpdateWorkflowDraftRequest:
+      type: object
+      required: [definition]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 120 }
+        description: { type: string, maxLength: 1000 }
+        definition: { $ref: '#/components/schemas/WorkflowDefinition' }
+      additionalProperties: false
+
+    ValidationReport:
+      type: object
+      description: |
+        The result of running the identical validator used on write, so an
+        editor can get authoritative feedback without persisting anything.
+      required: [valid, errors]
+      properties:
+        valid: { type: boolean }
+        errors:
+          type: array
+          items: { $ref: '#/components/schemas/ValidationError' }
+        warnings:
+          type: array
+          items: { $ref: '#/components/schemas/ValidationError' }
+      additionalProperties: false
+
+    WorkflowPage:
+      allOf:
+        - $ref: '#/components/schemas/CursorPage'
+        - type: object
+          properties:
+            data:
+              type: array
+              items: { $ref: '#/components/schemas/Workflow' }
+
+    WorkflowVersionPage:
+      allOf:
+        - $ref: '#/components/schemas/CursorPage'
+        - type: object
+          properties:
+            data:
+              type: array
+              items: { $ref: '#/components/schemas/WorkflowVersion' }
+
+    # --- Executions --------------------------------------------------------
+
+    Execution:
+      type: object
+      required: [id, workflowId, workflowVersionId, state, triggerType, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        workflowId: { type: string, format: uuid }
+        workflowSlug: { type: string }
+        workflowVersionId:
+          type: string
+          format: uuid
+          description: |
+            The version this execution evaluates, **pinned permanently**. The
+            definition behind this id is byte-identical to what was published and
+            will not change, so the run is reproducible and its audit trail is
+            trustworthy.
+        workflowVersionNumber: { type: integer, minimum: 1 }
+        state: { $ref: '#/components/schemas/ExecutionState' }
+        generation:
+          type: integer
+          minimum: 0
+          default: 0
+          description: |
+            Increments **only** on operator-initiated retry, and is part of every
+            `externalKey` this execution's steps send. Automatic recovery reuses
+            the same generation so the customer system deduplicates it; an operator
+            retry increments it so the customer system treats it as the deliberate
+            new attempt it is.
+        errorPolicy: { $ref: '#/components/schemas/ErrorPolicy' }
+        triggerType: { $ref: '#/components/schemas/TriggerType' }
+        dedupKey:
+          type: [string, 'null']
+          description: |
+            The unique key that made this trigger safe to repeat, or `null` when
+            the trigger is not deduplicated. This is the first field to read when
+            investigating a suspected duplicate: two runs with the same key are one
+            business event, and two with different keys are two intended runs.
+          examples: ['api:1f0c…:8a1b2c3d']
+        input: {}
+        output: {}
+        stateCounts:
+          type: object
+          description: Step counts by state. Cheap to compute from a single-table query, and the fastest way to see where an execution is.
+          additionalProperties: { type: integer }
+        cancelRequestedAt: { type: [string, 'null'], format: date-time }
+        cancelReason: { type: [string, 'null'] }
+        errorCode:
+          type: [string, 'null']
+          description: Why the execution reached `FAILED` or `TIMED_OUT`, in terms an API consumer can branch on.
+        createdAt: { type: string, format: date-time }
+        startedAt: { type: [string, 'null'], format: date-time }
+        completedAt: { type: [string, 'null'], format: date-time }
+      additionalProperties: false
+
+    TriggerExecutionRequest:
+      type: object
+      required: [workflowSlug]
+      properties:
+        workflowSlug: { type: string }
+        version:
+          type: [integer, 'null']
+          minimum: 1
+          description: |
+            Pin this trigger to a specific **published** version. Omit to use the
+            workflow's current version. Pinning is how a caller reproduces a
+            historical run exactly.
+        input: {}
+      additionalProperties: false
+
+    StepExecution:
+      type: object
+      description: |
+        One materialised node. Every node of the pinned version exists from the
+        moment the execution is created, including nodes still waiting on a
+        predecessor — so this list is complete, and reconciliation is a pure
+        function of the table.
+      required: [id, executionId, nodeId, nodeType, state, attempt, generation]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: The `stepExecutionId`. This, not the definition's `nodeId`, is what step endpoints address.
+        executionId: { type: string, format: uuid }
+        nodeId: { type: string }
+        nodeType: { $ref: '#/components/schemas/StepType' }
+        state: { $ref: '#/components/schemas/StepState' }
+        attempt:
+          type: integer
+          minimum: 0
+          description: |
+            The **domain** attempt count, held here rather than in the queue. The
+            queue's own `attempts: 3` is a transport-level tolerance for worker
+            death and stalled jobs, and deliberately does **not** cap this number.
+        generation:
+          type: integer
+          minimum: 0
+          description: Copied from the execution. Part of every `externalKey`.
+        availableAt:
+          type: [string, 'null']
+          format: date-time
+          description: |
+            When this step becomes eligible to run, for both retries and `delay`
+            steps. This is the authoritative schedule, and it is why a six-hour
+            wait is a row rather than a job sitting in Redis.
+        externalKey:
+          type: string
+          description: '`exec:{executionId}:step:{nodeId}:g{generation}` — sent to the customer system as `Idempotency-Key` on `http` and `email` steps.'
+          examples: ['exec:8f2c1d90-…:step:charge-payment:g0']
+        errorClass: { $ref: '#/components/schemas/ErrorClass' }
+        errorCode: { type: [string, 'null'] }
+        errorMessage: { type: [string, 'null'] }
+        output:
+          description: |
+            The step's output, **omitted** unless the caller holds
+            `execution:secret-read`, because a step output can contain sensitive
+            data. Without that permission, `redactedPaths` is returned instead.
+        redactedPaths:
+          type: array
+          description: JSON Paths within `output` that look like credentials, listed rather than returned.
+          items: { type: string }
+        attemptsLog:
+          type: array
+          description: |
+            The full attempt history. The first thing to read when diagnosing a
+            retried step: which attempt failed, with which class, and how long it
+            took.
+          items: { $ref: '#/components/schemas/AttemptRecord' }
+        startedAt: { type: [string, 'null'], format: date-time }
+        completedAt: { type: [string, 'null'], format: date-time }
+        durationMs: { type: [integer, 'null'] }
+      additionalProperties: false
+
+    AttemptRecord:
+      type: object
+      required: [attempt, outcome, startedAt]
+      properties:
+        attempt: { type: integer, minimum: 1 }
+        outcome: { type: string, enum: [SUCCEEDED, FAILED, TIMED_OUT, CANCELLED] }
+        errorClass: { $ref: '#/components/schemas/ErrorClass' }
+        errorCode: { type: [string, 'null'] }
+        errorMessage: { type: [string, 'null'] }
+        retryAfterMs:
+          type: [integer, 'null']
+          description: |
+            The delay the engine actually applied. When the target returned
+            `Retry-After`, that value is honoured **exactly and not jittered** —
+            the server knows better than our jitter does.
+        startedAt: { type: string, format: date-time }
+        durationMs: { type: integer }
+      additionalProperties: false
+
+    ExecutionPage:
+      allOf:
+        - $ref: '#/components/schemas/CursorPage'
+        - type: object
+          properties:
+            data:
+              type: array
+              items: { $ref: '#/components/schemas/Execution' }
+
+    StepExecutionPage:
+      allOf:
+        - $ref: '#/components/schemas/CursorPage'
+        - type: object
+          properties:
+            data:
+              type: array
+              items: { $ref: '#/components/schemas/StepExecution' }
+
+    # --- Webhook endpoints -------------------------------------------------
+
+    WebhookEndpoint:
+      type: object
+      required: [id, publicId, url, workflowId, enabled, dedupStrategy, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        publicId:
+          type: string
+          description: |
+            A 128-bit random public identifier, distinct from `id`. There is no
+            lookup by organization slug, so endpoints cannot be enumerated.
+        url:
+          type: string
+          format: uri-reference
+          description: The inbound URL, `https://api.automia.dev/v1/webhooks/{publicId}`.
+        workflowId: { type: string, format: uuid }
+        enabled: { type: boolean }
+        dedupStrategy: { $ref: '#/components/schemas/DedupStrategy' }
+        eventIdSource:
+          type: object
+          description: Where the external event id is read from. Absent when `dedupStrategy` is `body_hash`.
+          properties:
+            header: { type: [string, 'null'] }
+            jsonPath: { type: [string, 'null'] }
+        secretRotatedAt: { type: [string, 'null'], format: date-time }
+        createdBy: { type: string, format: uuid }
+        createdAt: { type: string, format: date-time }
+      additionalProperties: false
+
+    DedupStrategy:
+      type: string
+      description: |
+        How replay protection identifies "the same event". Choose deliberately:
+        the two options have materially different guarantees.
+      enum: [event_id, body_hash]
+      default: event_id
+
+    CreateWebhookEndpointRequest:
+      type: object
+      required: [workflowId]
+      properties:
+        workflowId: { type: string, format: uuid }
+        name: { type: string, maxLength: 100 }
+        dedupStrategy: { $ref: '#/components/schemas/DedupStrategy' }
+        eventIdHeader:
+          type: [string, 'null']
+          description: Read the external event id from this header, for example a provider's own delivery-id header. Preferred over a JSON path.
+        eventIdJsonPath:
+          type: [string, 'null']
+          description: Read the external event id from this JSON path in the body.
+        schema:
+          type: object
+          description: JSON Schema the body must satisfy. A failure is `400` and is recorded as `REJECTED_INVALID_PAYLOAD`.
+          additionalProperties: true
+      additionalProperties: false
+
+    UpdateWebhookEndpointRequest:
+      type: object
+      properties:
+        name: { type: string, maxLength: 100 }
+        enabled:
+          type: boolean
+          description: '`false` stops accepting deliveries without deleting the endpoint or its history.'
+        schema: { type: object, additionalProperties: true }
+        rotateSecret:
+          type: boolean
+          description: 'Issues a new secret. The previous one is accepted for a rotation window, so a rotation need not cause downtime.'
+      additionalProperties: false
+
+    CreatedWebhookEndpoint:
+      allOf:
+        - $ref: '#/components/schemas/WebhookEndpoint'
+        - type: object
+          required: [signingSecret]
+          properties:
+            signingSecret:
+              type: string
+              description: The HMAC-SHA256 secret. Present in this response **only**.
+            replayProtection:
+              type: string
+              description: A plain statement of the guarantee this endpoint's configuration actually provides. With `body_hash` it says so explicitly rather than leaving the weaker guarantee to be discovered.
+
+    WebhookDelivery:
+      type: object
+      required: [id, webhookEndpointId, status, receivedAt]
+      properties:
+        id: { type: string, format: uuid }
+        webhookEndpointId: { type: string, format: uuid }
+        externalEventId:
+          type: [string, 'null']
+          description: The event id this delivery was deduplicated on. `null` for a rejected delivery, whose payload is not stored.
+        dedupStrategy:
+          allOf: [{ $ref: '#/components/schemas/DedupStrategy' }]
+          description: Which strategy this row was evaluated under, so a weaker guarantee is visible during incident review.
+        status: { $ref: '#/components/schemas/WebhookDeliveryStatus' }
+        rejectionReason: { type: [string, 'null'] }
+        executionId:
+          type: [string, 'null']
+          format: uuid
+          description: The execution this delivery created, or the existing one when the delivery was a duplicate.
+        createdExecution: { type: [boolean, 'null'] }
+        receivedAt: { type: string, format: date-time }
+      additionalProperties: false
+
+    WebhookEndpointPage:
+      allOf:
+        - $ref: '#/components/schemas/CursorPage'
+        - type: object
+          properties:
+            data:
+              type: array
+              items: { $ref: '#/components/schemas/WebhookEndpoint' }
+
+    WebhookDeliveryPage:
+      allOf:
+        - $ref: '#/components/schemas/CursorPage'
+        - type: object
+          properties:
+            data:
+              type: array
+              items: { $ref: '#/components/schemas/WebhookDelivery' }
+
+    # --- Schedules ---------------------------------------------------------
+
+    Schedule:
+      type: object
+      description: |
+        The recurrence rule and next due instant live in **PostgreSQL**, not in a
+        Redis cron registry, so "when does this run next?" is answerable from the
+        system of record and a Redis flush cannot lose the schedule.
+      required: [id, workflowId, cron, timezone, enabled, nextFireAt, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        workflowId: { type: string, format: uuid }
+        cron:
+          type: string
+          description: Five fields, UTC-evaluated against `timezone`.
+          examples: ['0 9 * * 1-5']
+        timezone:
+          type: string
+          description: IANA zone. Stored so the rule survives a platform tzdata change.
+          examples: ['Europe/Zurich']
+        input: {}
+        enabled: { type: boolean }
+        nextFireAt:
+          type: [string, 'null']
+          format: date-time
+          description: '`null` when disabled or when the rule can fire no more.'
+        lastFiredAt: { type: [string, 'null'], format: date-time }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+      additionalProperties: false
+
+    CreateScheduleRequest:
+      type: object
+      required: [workflowId, cron, timezone]
+      properties:
+        workflowId: { type: string, format: uuid }
+        cron: { type: string, minLength: 1, maxLength: 100 }
+        timezone: { type: string, minLength: 1, maxLength: 64 }
+        input: {}
+      additionalProperties: false
+
+    UpdateScheduleRequest:
+      type: object
+      properties:
+        cron: { type: string, minLength: 1, maxLength: 100 }
+        timezone: { type: string, minLength: 1, maxLength: 64 }
+        input: {}
+        enabled: { type: boolean }
+      additionalProperties: false
+
+    SchedulePage:
+      allOf:
+        - $ref: '#/components/schemas/CursorPage'
+        - type: object
+          properties:
+            data:
+              type: array
+              items: { $ref: '#/components/schemas/Schedule' }
+
+    # --- Credentials -------------------------------------------------------
+
+    Credential:
+      type: object
+      description: |
+        Metadata only. The secret is envelope-encrypted into `ciphertext` and
+        `wrapped_dek`; **no endpoint can reveal it**, and there is no serialiser
+        for `ciphertext`, so it cannot leak through an unrelated response.
+      required: [id, name, kind, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        kind:
+          type: string
+          description: Which provider this credential is for, which determines how a step applies it.
+          enum: [http_header, http_bearer, smtp, oauth_client]
+        description: { type: [string, 'null'] }
+        updatedAt: { type: string, format: date-time }
+        createdBy: { type: string, format: uuid }
+        createdAt: { type: string, format: date-time }
+      additionalProperties: false
+
+    CreateCredentialRequest:
+      type: object
+      required: [name, kind, secret]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        kind: { type: string, enum: [http_header, http_bearer, smtp, oauth_client] }
+        description: { type: string, maxLength: 500 }
+        secret:
+          type: string
+          minLength: 1
+          writeOnly: true
+          description: Envelope-encrypted immediately and never logged or echoed.
+      additionalProperties: false
+
+    CredentialPage:
+      allOf:
+        - $ref: '#/components/schemas/CursorPage'
+        - type: object
+          properties:
+            data:
+              type: array
+              items: { $ref: '#/components/schemas/Credential' }
+
+    # --- Audit -------------------------------------------------------------
+
+    AuditLog:
+      type: object
+      description: |
+        Append-only, and written in the **same transaction** as the action it
+        describes. An action therefore cannot succeed without its audit record —
+        which is why audit is not best-effort, unlike logging.
+      required: [id, action, actorType, occurredAt]
+      properties:
+        id: { type: string, format: uuid }
+        action:
+          type: string
+          description: 'Dotted, namespaced. Examples: `workflow.published`, `execution.triggered`, `execution.retried`, `credential.updated`, `apikey.revoked`, `auth.sign_in_failed`.'
+          examples: ['workflow.published']
+        actorType: { $ref: '#/components/schemas/ActorType' }
+        actorId:
+          type: [string, 'null']
+          format: uuid
+          description: The user or API key. `null` for `system`, `scheduler`, and `worker` actors.
+        organizationId: { type: [string, 'null'], format: uuid }
+        targetType: { type: [string, 'null'] }
+        targetId: { type: [string, 'null'] }
+        requestId: { type: [string, 'null'] }
+        traceId: { type: [string, 'null'] }
+        ip:
+          type: [string, 'null']
+          description: The client IP, from a trusted-proxy allowlist only. Never taken from an unvalidated header.
+        detail:
+          type: object
+          additionalProperties: true
+          description: |
+            Structured context, with the same redaction rules as logs: no
+            credentials, no `Authorization`, no cookie headers, and no step output
+            that has not already been classified.
+        occurredAt: { type: string, format: date-time }
+      additionalProperties: false
+
+    AuditLogPage:
+      allOf:
+        - $ref: '#/components/schemas/CursorPage'
+        - type: object
+          properties:
+            data:
+              type: array
+              items: { $ref: '#/components/schemas/AuditLog' }
